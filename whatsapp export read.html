@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>WhatsApp Export Viewer</title>
+<style>
+  :root{
+    --wa-green:#075e54; --bg:#e6ddd6; --me-bubble:#dcf8c6; --other-bubble:#fff; --muted:#666;
+    --bubble-radius:18px; --chat-width:820px;
+  }
+  body{font-family:system-ui,Segoe UI,Roboto,Arial;margin:0;background:var(--bg);color:#111}
+  .wrap{max-width:var(--chat-width);margin:12px auto;padding:12px;}
+  header{background:linear-gradient(90deg,var(--wa-green),#128c7e);color:#fff;padding:12px;border-radius:8px}
+  .controls{display:flex;gap:12px;flex-wrap:wrap;padding:12px;background:#fff;border-radius:8px;margin-top:8px;align-items:center}
+  .controls input[type=file], .controls input[type=text], select, button{padding:8px;border-radius:8px;border:1px solid #e6e6e6}
+  .chat{height:60vh;overflow:auto;margin-top:12px;padding:18px;border-radius:8px;background:linear-gradient(#e6ddd6,#e5ddd5)}
+  .msg-row{display:flex;align-items:flex-end;margin:8px 0;gap:10px}
+  .msg-row.left{justify-content:flex-start}
+  .msg-row.right{justify-content:flex-start;flex-direction:row-reverse}
+  .avatar{width:40px;height:40px;border-radius:50%;background:#cfcfcf;color:#fff;display:flex;align-items:center;justify-content:center;font-weight:700}
+  .bubble{max-width:70%;padding:8px 12px;border-radius:var(--bubble-radius);box-shadow:0 1px 0 rgba(0,0,0,0.04);position:relative}
+  .bubble.me{background:var(--me-bubble);border-bottom-right-radius:6px}
+  .bubble.other{background:var(--other-bubble);border-bottom-left-radius:6px}
+  .bubble .meta{font-size:11px;color:var(--muted);margin-top:6px}
+  .note{font-size:13px;color:#333}
+  .btn-small{padding:6px 8px;border-radius:8px;border:1px solid #ddd;background:#f6f6f6;cursor:pointer}
+  .selected-indicator{display:inline-block;margin-left:8px;color:var(--wa-green);font-weight:600}
+  .hint{font-size:13px;color:#444}
+  .controls-row{display:flex;gap:8px;align-items:center}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header><h2>WhatsApp Export Viewer</h2></header>
+
+  <div class="controls">
+    <div>
+      <label>Chat .txt</label><br>
+      <input id="chatFile" type="file" accept=".txt" />
+    </div>
+    <div>
+      <label>Or ZIP (chat + media)</label><br>
+      <input id="zipFile" type="file" accept=".zip" />
+    </div>
+    <div>
+      <label>Media folder</label><br>
+      <input id="mediaFiles" type="file" webkitdirectory directory multiple />
+    </div>
+
+    <div style="min-width:220px">
+      <label>Select your identity</label><br>
+      <select id="meSelect"><option value="">-- choose detected --</option></select>
+      <div class="hint">Auto-suggested is most frequent sender.</div>
+    </div>
+
+    <div style="margin-left:auto" class="controls-row">
+      <input id="manualName" type="text" placeholder="Or type your display name" />
+      <button id="applyManual" class="btn-small">Set as You</button>
+      <button id="parseBtn" style="background:var(--wa-green);color:#fff;border:none;padding:8px 12px;border-radius:8px">Parse & Show</button>
+    </div>
+  </div>
+
+  <div class="note">Click any message bubble to mark that sender as <strong>You</strong>.</div>
+  <div id="chat" class="chat"></div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+
+<script>
+const chatEl = document.getElementById('chat');
+const chatFileInput = document.getElementById('chatFile');
+const zipInput = document.getElementById('zipFile');
+const mediaInput = document.getElementById('mediaFiles');
+const meSelect = document.getElementById('meSelect');
+const parseBtn = document.getElementById('parseBtn');
+const manualName = document.getElementById('manualName');
+const applyManual = document.getElementById('applyManual');
+
+let chatText='', chatSourceName='', messages=[], participants=new Set();
+let mediaFilesMap=new Map();
+
+function normalizeDisplayName(n){return n?n.replace(/[\u200B-\u200D\uFEFF]/g,'').trim().replace(/\s+/g,' '):''}
+function stripEmojis(s){return s?s.replace(/[\u{1F300}-\u{1F9FF}\u{2600}-\u{27BF}]/gu,'').trim():s}
+function escapeHtml(s){return s?s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'):''}
+function initials(n){return n?n.split(' ').map(s=>s[0]).slice(0,2).join('').toUpperCase():'?'}
+
+function renderMedia(name){
+  if(!name) return '';
+  if(name==='<omitted>') return '<div class="hint">📎 Media omitted</div>';
+  const file=mediaFilesMap.get(name.toLowerCase());
+  if(!file) return `<div class="hint">📎 ${name}</div>`;
+  const url=URL.createObjectURL(file);
+  if(/\.(jpg|jpeg|png|gif)$/i.test(name)) return `<img src="${url}" style="max-width:100%;border-radius:12px;margin-top:6px">`;
+  if(/\.(mp4|mov|webm|3gp)$/i.test(name)) return `<video controls src="${url}" style="max-width:100%;border-radius:12px;margin-top:6px"></video>`;
+  if(/\.(mp3|wav|ogg|opus)$/i.test(name)) return `<audio controls src="${url}" style="margin-top:6px"></audio>`;
+  return `<a href="${url}" download="${name}">📄 ${name}</a>`;
+}
+
+function parseWhatsAppExport(txt){
+  participants=new Set(); txt=txt.replace(/\r/g,'');
+  const lines=txt.split('\n'), out=[]; let cur=null;
+  for(const raw of lines){
+    const m=raw.match(/^(.+?) - (.+?): (.*)$/);
+    if(m){
+      if(cur) out.push(cur);
+      const msg=m[3];
+      const mediaMatch=msg.match(/([\w\-\.\(\) ]+\.(jpg|jpeg|png|gif|mp4|3gp|mov|webm|mp3|wav|ogg|opus|pdf|docx|xlsx|pptx))/i);
+      const omitted=/<Media omitted>/i.test(msg);
+      cur={timestamp:m[1],sender:m[2],message:msg,media:mediaMatch?mediaMatch[1]:(omitted?'<omitted>':null)};
+      participants.add(normalizeDisplayName(m[2]));
+    } else if(cur) cur.message+='\n'+raw;
+  }
+  if(cur) out.push(cur);
+  return out;
+}
+
+function renderMessages(){
+  chatEl.innerHTML='';
+  const you=meSelect.value||manualName.value;
+  messages.forEach(m=>{
+    const isMe=you && stripEmojis(normalizeDisplayName(m.sender)).toLowerCase()===stripEmojis(normalizeDisplayName(you)).toLowerCase();
+    const row=document.createElement('div'); row.className='msg-row '+(isMe?'right':'left');
+    const av=document.createElement('div'); av.className='avatar'; av.textContent=initials(m.sender);
+    const b=document.createElement('div'); b.className='bubble '+(isMe?'me':'other');
+    let html=`<div class="text">${escapeHtml(m.message)}</div>`;
+    if(m.media) html+=renderMedia(m.media);
+    b.innerHTML=html+`<div class="meta">${m.sender} • ${m.timestamp}</div>`;
+    b.onclick=()=>{meSelect.value=m.sender;manualName.value=m.sender;renderMessages();}
+    row.append(av,b); chatEl.appendChild(row);
+  });
+  chatEl.scrollTop=chatEl.scrollHeight;
+}
+
+chatFileInput.onchange=async e=>{
+  const f=e.target.files[0]; if(!f)return;
+  chatSourceName=f.name; chatText=await f.text();
+  messages=parseWhatsAppExport(chatText);
+  populateSelect(); renderMessages();
+};
+
+zipInput.onchange=async e=>{
+  const f=e.target.files[0]; if(!f)return;
+  const zip=await JSZip.loadAsync(await f.arrayBuffer());
+  mediaFilesMap=new Map();
+  for(const k in zip.files){
+    const e=zip.files[k]; if(e.dir)continue;
+    const n=k.split('/').pop().toLowerCase();
+    if(n.endsWith('.txt')) chatText=await e.async('text');
+    else mediaFilesMap.set(n,new File([await e.async('blob')],n));
+  }
+  messages=parseWhatsAppExport(chatText);
+  populateSelect(); renderMessages();
+};
+
+mediaInput.onchange=e=>{
+  mediaFilesMap=new Map();
+  [...e.target.files].forEach(f=>mediaFilesMap.set(f.name.toLowerCase(),f));
+};
+
+function populateSelect(){
+  meSelect.innerHTML='<option value="">-- choose detected --</option>';
+  [...participants].forEach(p=>{
+    const o=document.createElement('option'); o.value=p; o.textContent=p;
+    meSelect.appendChild(o);
+  });
+}
+
+applyManual.onclick=()=>renderMessages();
+parseBtn.onclick=()=>renderMessages();
+meSelect.onchange=()=>{manualName.value=meSelect.value;renderMessages();}
+</script>
+</body>
+</html>

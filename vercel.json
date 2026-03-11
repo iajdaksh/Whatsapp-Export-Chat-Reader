@@ -2,14 +2,14 @@
   "version": 2,
   "builds": [
     {
-      "src": "whatsapp-viewer.html",
+      "src": "whatsapp export read.html",
       "use": "@vercel/static"
     }
   ],
   "routes": [
     {
       "src": "/",
-      "dest": "/whatsapp-viewer.html"
+      "dest": "/whatsapp export read.html"
     }
   ]
 }
